@@ -1,6 +1,8 @@
 # ROS + JAX on macOS — Experiments
 
-Exploration of running JAX (and eventually ROS) natively on macOS with Apple Silicon.
+Exploration of running JAX and ROS natively on macOS with Apple Silicon.
+
+> **Current focus: JAX.** ROS setup and experiments will be added in a future phase.
 
 ---
 
