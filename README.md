@@ -4,6 +4,10 @@ Exploration of running JAX and ROS natively on macOS with Apple Silicon.
 
 > **Current focus: JAX.** ROS setup and experiments will be added in a future phase.
 
+## Possible Explorations
+
+- Consider adding some benchmark that uses both CPU and GPU.
+
 ---
 
 ## Do ROS and JAX work on macOS?
