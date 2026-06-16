@@ -1,0 +1,14 @@
+# CUDA 12 backend — Linux + NVIDIA only.
+# Install with:
+#   pip install -r requirements-cuda.txt \
+#     --find-links https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+#
+# jax[cuda12] pulls in the matching jaxlib-cuda wheel automatically.
+# No version pin here — pick whatever is current and test it.
+# Do NOT install jax-metal alongside this.
+jax[cuda12]
+ml_dtypes
+numpy
+opt_einsum
+scipy
+matplotlib

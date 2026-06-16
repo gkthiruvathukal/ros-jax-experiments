@@ -19,8 +19,7 @@ Short answer: partially, and with caveats.
 - **CPU**: works out of the box via `pip install jax`.
 - **Apple Silicon GPU (Metal)**: works via the `jax-metal` plugin, but the plugin
   lags behind JAX releases. See the version pinning section below.
-- **CUDA GPU**: not available on macOS; Linux + CUDA remains the gold standard
-  for GPU-heavy JAX workloads.
+- **NVIDIA GPU (CUDA)**: Linux only; remains the gold standard for GPU-heavy JAX workloads.
 
 ### ROS
 
@@ -64,6 +63,9 @@ jaxlib==0.4.34
 jax-metal==0.1.1
 ```
 
+This constraint does **not** apply to the CUDA backend — on Linux you can use a
+current JAX release.
+
 ---
 
 ## Setup
@@ -94,34 +96,111 @@ cd ros-jax-experiments
 ### Install dependencies
 
 ```bash
-make install
+make install              # Apple Silicon / Metal (default)
+make install BACKEND=cuda # Linux + NVIDIA
+make install BACKEND=cpu  # CPU-only, any platform
 ```
 
-This creates a `.venv/` virtual environment using Python 3.12 and installs all
-pinned dependencies from `requirements.txt`. You only need to do this once.
+This creates a `.venv/` virtual environment using Python 3.12 and installs the
+pinned dependencies for the selected backend. You only need to do this once
+(re-run if you switch backends).
 
 ### Available commands
 
 | Command | What it does |
 |---------|-------------|
-| `make install` | Create `.venv` and install pinned dependencies |
-| `make test` | Correctness checks + quick CPU vs Metal timing table |
+| `make install` | Create `.venv` and install pinned dependencies (Metal by default) |
+| `make install BACKEND=cuda` | Install CUDA dependencies instead |
+| `make install BACKEND=cpu` | Install CPU-only dependencies |
+| `make test` | Correctness checks + quick timing table |
 | `make benchmark` | Full size sweep — saves `benchmark.png` |
 | `make clean` | Delete `.venv` (re-run `make install` to start fresh) |
 
-### Running manually (without make)
+---
+
+## CLI reference
+
+Both scripts accept the same core flags.
+
+### `jax_test.py` — correctness checks + quick table
+
+```
+python jax_test.py [--devices DEVICE [DEVICE ...]]
+                   [--repeats N]
+                   [--no-correctness]
+                   [--no-benchmark]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--devices` | all detected | Which devices to benchmark: `cpu`, `metal`, `cuda` |
+| `--repeats N` | `20` | Timed repetitions per measurement |
+| `--no-correctness` | off | Skip autograd / vmap checks |
+| `--no-benchmark` | off | Skip timing table |
+
+Examples:
+
+```bash
+# default — all detected devices
+python jax_test.py
+
+# Metal + CPU comparison only
+python jax_test.py --devices cpu metal
+
+# CUDA machine, skip correctness, quick run
+python jax_test.py --devices cpu cuda --no-correctness --repeats 5
+```
+
+### `benchmark_plot.py` — full sweep + chart
+
+```
+python benchmark_plot.py [--devices DEVICE [DEVICE ...]]
+                         [--ops OP [OP ...]]
+                         [--sizes N [N ...]]
+                         [--repeats N]
+                         [--no-plot]
+                         [--out FILE]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--devices` | all detected | `cpu`, `metal`, `cuda` |
+| `--ops` | all | `matmul`, `elemwise`, `reduction` |
+| `--sizes` | `64 128 256 512 1024 2048 4096` | Matrix sizes (N×N) to sweep |
+| `--repeats N` | `20` | Timed repetitions per measurement |
+| `--no-plot` | off | Print table only, skip chart |
+| `--out FILE` | `benchmark.png` | Output filename for the chart |
+
+Examples:
+
+```bash
+# default — all ops, all detected devices, save benchmark.png
+python benchmark_plot.py
+
+# matmul only, cpu vs metal, no chart
+python benchmark_plot.py --ops matmul --devices cpu metal --no-plot
+
+# CUDA machine, subset of sizes, custom output
+python benchmark_plot.py --devices cpu cuda --sizes 256 1024 4096 --out cuda.png
+```
+
+---
+
+## Running manually (without make)
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements-metal.txt   # or requirements-cuda.txt / requirements-cpu.txt
 
 .venv/bin/python jax_test.py       # correctness + quick benchmark
 .venv/bin/python benchmark_plot.py # full benchmark → benchmark.png
 ```
 
-### Expected output
+---
 
-`make test` prints a correctness check followed by a timing table:
+## Expected output
+
+`make test` / `jax_test.py` prints a correctness check followed by a timing table:
 
 ```
 JAX 0.4.34  |  cpu: TFRT_CPU_0  |  metal: METAL:0
@@ -131,13 +210,13 @@ JAX 0.4.34  |  cpu: TFRT_CPU_0  |  metal: METAL:0
 [2] autograd        : grad=[-4. -2.  2.]  (expected [-4, -2, 2])
 [3] vmap            : (8, 4) · (4,) -> (8,)
 
-=== CPU vs Metal benchmark (median ms/call) ===
+=== Quick benchmark (median ms/call, 20 reps) ===
 ...
 ```
 
-`make benchmark` prints progress as it runs and writes `benchmark.png` when done.
-The chart title and hardware footer are auto-discovered from your machine —
-no editing needed to run on a different chip.
+`make benchmark` / `benchmark_plot.py` prints progress as it runs and writes
+`benchmark.png` when done. The chart title and hardware footer are
+auto-discovered from your machine — no editing needed to run on a different chip.
 
 ---
 
@@ -193,14 +272,18 @@ Generated by `make benchmark`. Both axes are log scale. Key observations:
 - **Element-wise**: Metal's dispatch floor is nearly flat 128–512 while CPU scales linearly; Metal wins from ~256 onwards and is ~37× faster at 4096².
 - **Reduction**: CPU faster up to ~2048×2048 because reductions aren't embarrassingly parallel; Metal only edges ahead at the largest sizes.
 
+---
+
 ## Project layout
 
 ```
 .
-├── README.md            # this file
-├── Makefile             # install / test / benchmark / clean targets
-├── requirements.txt     # pinned dependencies
-├── jax_test.py          # correctness checks + quick CPU vs Metal table
-├── benchmark_plot.py    # full sweep across sizes, saves benchmark.png
-└── benchmark.png        # latest generated chart
+├── README.md                # this file
+├── Makefile                 # install / test / benchmark / clean targets
+├── requirements-metal.txt   # pinned deps for Apple Silicon / Metal
+├── requirements-cuda.txt    # deps for Linux + NVIDIA CUDA
+├── requirements-cpu.txt     # CPU-only deps, any platform
+├── jax_test.py              # correctness checks + quick benchmark table
+├── benchmark_plot.py        # full sweep across sizes, saves benchmark.png
+└── benchmark.png            # latest generated chart
 ```

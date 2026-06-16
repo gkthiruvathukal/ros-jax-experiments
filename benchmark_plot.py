@@ -1,7 +1,25 @@
-"""Benchmark CPU vs Metal across matrix sizes and save a chart."""
+"""Benchmark JAX ops across devices and (optionally) save a chart.
 
+Usage examples
+--------------
+  # default: cpu + metal (or cuda if detected), all ops, plot saved
+  python benchmark_plot.py
+
+  # explicit devices, subset of ops, custom sizes
+  python benchmark_plot.py --devices cpu metal --ops matmul elemwise
+
+  # table only, no chart
+  python benchmark_plot.py --no-plot
+
+  # CUDA run on a Linux machine
+  python benchmark_plot.py --devices cpu cuda --out cuda_results.png
+"""
+
+import argparse
 import subprocess
 import time
+import sys
+
 import jax
 import jax.numpy as jnp
 from jax import jit
@@ -9,6 +27,8 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import numpy as np
 
+
+# ── Hardware info helpers ─────────────────────────────────────────────────────
 
 def _sysctl(key, default=None):
     try:
@@ -18,20 +38,19 @@ def _sysctl(key, default=None):
 
 
 def chip_name():
-    return _sysctl("machdep.cpu.brand_string", "Apple Silicon")
+    return _sysctl("machdep.cpu.brand_string", "Unknown CPU")
 
 
 def system_info():
-    cpu_total = int(_sysctl("hw.physicalcpu", 0))
-    cpu_perf  = int(_sysctl("hw.perflevel0.physicalcpu", 0))
-    cpu_eff   = int(_sysctl("hw.perflevel1.physicalcpu", 0))
+    cpu_total = int(_sysctl("hw.physicalcpu", 0) or 0)
+    cpu_perf  = int(_sysctl("hw.perflevel0.physicalcpu", 0) or 0)
+    cpu_eff   = int(_sysctl("hw.perflevel1.physicalcpu", 0) or 0)
     try:
         gpu_cores = int(subprocess.check_output(
             ["system_profiler", "SPDisplaysDataType"], text=True
         ).split("Total Number of Cores:")[1].split()[0])
     except Exception:
         gpu_cores = None
-
     return {
         "cpu_total": cpu_total,
         "cpu_perf":  cpu_perf,
@@ -39,11 +58,36 @@ def system_info():
         "gpu_cores": gpu_cores,
     }
 
-CPU   = jax.devices('cpu')[0]
-METAL = next((d for d in jax.devices() if 'METAL' in str(d).upper()), None)
 
-SIZES = [64, 128, 256, 512, 1024, 2048, 4096]
-REPEATS = 20
+# ── Device detection ──────────────────────────────────────────────────────────
+
+def detect_devices():
+    """Return a dict of available named devices: {'cpu': ..., 'metal': ..., 'cuda': ...}."""
+    found = {}
+    for d in jax.devices():
+        s = str(d).upper()
+        if "METAL" in s:
+            found.setdefault("metal", d)
+        elif "CUDA" in s or "GPU" in s:
+            found.setdefault("cuda", d)
+    found["cpu"] = jax.devices("cpu")[0]
+    return found
+
+
+def resolve_devices(requested, available):
+    """Validate requested device names against what is actually available."""
+    resolved = {}
+    for name in requested:
+        if name not in available:
+            print(f"WARNING: device '{name}' not available — skipping.")
+        else:
+            resolved[name] = available[name]
+    if not resolved:
+        sys.exit("ERROR: none of the requested devices are available. Aborting.")
+    return resolved
+
+
+# ── Ops ───────────────────────────────────────────────────────────────────────
 
 @jit
 def op_matmul(a):    return jnp.dot(a, a)
@@ -54,65 +98,106 @@ def op_elemwise(a):  return jnp.exp(jnp.sin(a) + jnp.cos(a))
 @jit
 def op_reduction(a): return jnp.sum(a ** 2)
 
-OPS = [
-    ("Matrix multiply", op_matmul),
-    ("Element-wise (exp·sin·cos)", op_elemwise),
-    ("Reduction (sum x²)", op_reduction),
-]
+ALL_OPS = {
+    "matmul":    ("Matrix multiply",             op_matmul),
+    "elemwise":  ("Element-wise (exp·sin·cos)",  op_elemwise),
+    "reduction": ("Reduction (sum x²)",           op_reduction),
+}
+
+DEFAULT_SIZES   = [64, 128, 256, 512, 1024, 2048, 4096]
+DEFAULT_REPEATS = 20
 
 
-def bench(fn, x):
-    fn(x).block_until_ready()          # warmup / compile
+# ── Benchmark core ────────────────────────────────────────────────────────────
+
+def bench(fn, x, repeats):
+    fn(x).block_until_ready()
     times = []
-    for _ in range(REPEATS):
+    for _ in range(repeats):
         t0 = time.perf_counter()
         fn(x).block_until_ready()
         times.append((time.perf_counter() - t0) * 1000)
     return float(np.median(times))
 
 
-def run_benchmarks():
+def run_benchmarks(ops, devices, sizes, repeats):
+    """
+    Returns:
+        results[op_key][device_name] = list of median-ms values (one per size)
+    """
     key = jax.random.PRNGKey(0)
-    results = {}
-    for op_name, fn in OPS:
-        cpu_ms, metal_ms = [], []
-        for n in SIZES:
+    results = {op_key: {dev: [] for dev in devices} for op_key in ops}
+
+    for op_key, (op_label, fn) in ops.items():
+        for n in sizes:
             x = jax.random.normal(key, (n, n))
-            cpu_ms.append(bench(fn, jax.device_put(x, CPU)))
-            if METAL:
-                metal_ms.append(bench(fn, jax.device_put(x, METAL)))
-            print(f"  {op_name}  {n}×{n}  cpu={cpu_ms[-1]:.2f}ms" +
-                  (f"  metal={metal_ms[-1]:.2f}ms" if METAL else ""))
-        results[op_name] = (cpu_ms, metal_ms if METAL else None)
+            row_parts = [f"{op_label}  {n}×{n}"]
+            for dev_name, device in devices.items():
+                ms = bench(fn, jax.device_put(x, device), repeats)
+                results[op_key][dev_name].append(ms)
+                row_parts.append(f"{dev_name}={ms:.2f}ms")
+            print("  " + "  ".join(row_parts))
+
     return results
 
 
-def plot(results, out="benchmark.png"):
+# ── Plotting ──────────────────────────────────────────────────────────────────
+
+COLORS = {
+    "cpu":    "#4C72B0",
+    "metal":  "#DD8452",
+    "cuda":   "#55A868",
+}
+
+MARKERS = {
+    "cpu":   "o",
+    "metal": "s",
+    "cuda":  "^",
+}
+
+
+def device_label(dev_name, info):
+    if dev_name == "cpu":
+        if info["cpu_perf"]:
+            return f"CPU ({info['cpu_perf']}P+{info['cpu_eff']}E cores)"
+        return f"CPU ({info['cpu_total']} cores)"
+    if dev_name == "metal":
+        return f"Metal GPU ({info['gpu_cores']} cores)" if info["gpu_cores"] else "Metal GPU"
+    if dev_name == "cuda":
+        return "CUDA GPU"
+    return dev_name.upper()
+
+
+def plot(results, ops, devices, sizes, out):
     info = system_info()
-    cpu_label = (f"CPU ({info['cpu_perf']}P+{info['cpu_eff']}E cores)"
-                 if info['cpu_perf'] else f"CPU ({info['cpu_total']} cores)")
-    gpu_label = (f"Metal GPU ({info['gpu_cores']} cores)"
-                 if info['gpu_cores'] else "Metal GPU")
-
-    n_ops = len(OPS)
+    n_ops = len(ops)
     fig, axes = plt.subplots(1, n_ops, figsize=(5 * n_ops, 4.5), sharey=False)
-    fig.suptitle(f"JAX: CPU vs Metal GPU — {chip_name()}\n(median ms/call, lower is better)",
-                 fontsize=13, fontweight="bold", y=1.02)
+    if n_ops == 1:
+        axes = [axes]
 
-    colors = {"CPU": "#4C72B0", "Metal": "#DD8452"}
+    fig.suptitle(
+        f"JAX: {' vs '.join(d.upper() for d in devices)} — {chip_name()}\n"
+        f"(median ms/call, lower is better)",
+        fontsize=13, fontweight="bold", y=1.02,
+    )
 
-    for ax, (op_name, fn) in zip(axes, OPS):
-        cpu_ms, metal_ms = results[op_name]
-        ax.plot(SIZES, cpu_ms,   "o-", color=colors["CPU"],   label=cpu_label, linewidth=2)
-        if metal_ms:
-            ax.plot(SIZES, metal_ms, "s-", color=colors["Metal"], label=gpu_label, linewidth=2)
-        ax.set_title(op_name, fontsize=11)
+    for ax, (op_key, (op_label, _)) in zip(axes, ops.items()):
+        for dev_name in devices:
+            ms_list = results[op_key][dev_name]
+            ax.plot(
+                sizes, ms_list,
+                f"{MARKERS.get(dev_name, 'o')}-",
+                color=COLORS.get(dev_name, "#888888"),
+                label=device_label(dev_name, info),
+                linewidth=2,
+            )
+        ax.set_title(op_label, fontsize=11)
         ax.set_xlabel("Matrix size (N×N)")
         ax.set_ylabel("Median time (ms)")
         ax.set_xscale("log", base=2)
         ax.set_yscale("log")
         ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda v, _: f"{int(v)}"))
-        ax.set_xticks(SIZES)
+        ax.set_xticks(sizes)
         ax.tick_params(axis="x", rotation=45)
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
@@ -130,10 +215,71 @@ def plot(results, out="benchmark.png"):
     print(f"\nSaved -> {out}")
 
 
-if __name__ == "__main__":
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    available = detect_devices()
+    default_devs = [d for d in ("cpu", "metal", "cuda") if d in available]
+
+    p = argparse.ArgumentParser(
+        description="Benchmark JAX ops across CPU / Metal / CUDA devices.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--devices", nargs="+",
+        choices=["cpu", "metal", "cuda"],
+        default=default_devs,
+        metavar="DEVICE",
+        help="Devices to benchmark. Choices: cpu, metal, cuda.",
+    )
+    p.add_argument(
+        "--ops", nargs="+",
+        choices=list(ALL_OPS),
+        default=list(ALL_OPS),
+        metavar="OP",
+        help=f"Ops to run. Choices: {', '.join(ALL_OPS)}.",
+    )
+    p.add_argument(
+        "--sizes", nargs="+", type=int,
+        default=DEFAULT_SIZES,
+        metavar="N",
+        help="Matrix sizes (N×N) to sweep.",
+    )
+    p.add_argument(
+        "--repeats", type=int, default=DEFAULT_REPEATS,
+        help="Number of timed repetitions per measurement.",
+    )
+    p.add_argument(
+        "--no-plot", action="store_true",
+        help="Skip chart generation; print table only.",
+    )
+    p.add_argument(
+        "--out", default="benchmark.png",
+        help="Output filename for the chart.",
+    )
+    return p.parse_args(), available
+
+
+def main():
+    args, available = parse_args()
+
+    devices = resolve_devices(args.devices, available)
+    ops     = {k: ALL_OPS[k] for k in args.ops}
+
     info = system_info()
     print(f"JAX {jax.__version__}  |  {chip_name()}")
     print(f"CPU: {info['cpu_perf']}P + {info['cpu_eff']}E cores ({info['cpu_total']} total)  |  "
-          f"GPU: {info['gpu_cores']} Metal cores\n")
-    results = run_benchmarks()
-    plot(results)
+          f"GPU: {info['gpu_cores']} Metal cores")
+    print(f"Devices : {', '.join(devices)}")
+    print(f"Ops     : {', '.join(ops)}")
+    print(f"Sizes   : {args.sizes}")
+    print(f"Repeats : {args.repeats}\n")
+
+    results = run_benchmarks(ops, devices, args.sizes, args.repeats)
+
+    if not args.no_plot:
+        plot(results, ops, devices, args.sizes, args.out)
+
+
+if __name__ == "__main__":
+    main()
