@@ -30,32 +30,97 @@ import numpy as np
 
 # ── Hardware info helpers ─────────────────────────────────────────────────────
 
+import platform
+
 def _sysctl(key, default=None):
     try:
-        return subprocess.check_output(["sysctl", "-n", key], text=True).strip()
+        return subprocess.check_output(
+            ["sysctl", "-n", key], text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
     except Exception:
         return default
 
 
+def _proc_cpuinfo_field(field):
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.startswith(field):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _nvidia_gpu_name():
+    try:
+        return subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip().splitlines()[0]
+    except Exception:
+        return None
+
+
+def _nvidia_gpu_count():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip().splitlines()
+        return len(out)
+    except Exception:
+        return None
+
+
 def chip_name():
-    return _sysctl("machdep.cpu.brand_string", "Unknown CPU")
+    # macOS
+    name = _sysctl("machdep.cpu.brand_string")
+    if name:
+        return name
+    # Linux: try /proc/cpuinfo, then nvidia-smi, then platform fallback
+    return (
+        _proc_cpuinfo_field("model name")
+        or _nvidia_gpu_name()
+        or platform.processor()
+        or "Unknown CPU"
+    )
 
 
 def system_info():
+    # macOS sysctl paths
     cpu_total = int(_sysctl("hw.physicalcpu", 0) or 0)
     cpu_perf  = int(_sysctl("hw.perflevel0.physicalcpu", 0) or 0)
     cpu_eff   = int(_sysctl("hw.perflevel1.physicalcpu", 0) or 0)
+
+    # Linux fallback for physical CPU count
+    if cpu_total == 0:
+        try:
+            import os
+            cpu_total = os.cpu_count() or 0
+        except Exception:
+            pass
+
+    # Metal GPU cores (macOS only)
+    metal_cores = None
     try:
-        gpu_cores = int(subprocess.check_output(
-            ["system_profiler", "SPDisplaysDataType"], text=True
+        metal_cores = int(subprocess.check_output(
+            ["system_profiler", "SPDisplaysDataType"],
+            text=True, stderr=subprocess.DEVNULL,
         ).split("Total Number of Cores:")[1].split()[0])
     except Exception:
-        gpu_cores = None
+        pass
+
+    # NVIDIA GPU count (Linux)
+    cuda_gpus = _nvidia_gpu_count()
+
     return {
-        "cpu_total": cpu_total,
-        "cpu_perf":  cpu_perf,
-        "cpu_eff":   cpu_eff,
-        "gpu_cores": gpu_cores,
+        "cpu_total":  cpu_total,
+        "cpu_perf":   cpu_perf,
+        "cpu_eff":    cpu_eff,
+        "gpu_cores":  metal_cores,   # Metal cores (macOS) or None
+        "cuda_gpus":  cuda_gpus,     # NVIDIA GPU count (Linux) or None
     }
 
 
@@ -164,8 +229,24 @@ def device_label(dev_name, info):
     if dev_name == "metal":
         return f"Metal GPU ({info['gpu_cores']} cores)" if info["gpu_cores"] else "Metal GPU"
     if dev_name == "cuda":
-        return "CUDA GPU"
+        gpu_name = _nvidia_gpu_name()
+        return f"CUDA GPU ({gpu_name})" if gpu_name else "CUDA GPU"
     return dev_name.upper()
+
+
+def _hw_footer(info):
+    parts = []
+    if info["cpu_perf"]:
+        parts.append(f"CPU: {info['cpu_perf']}P + {info['cpu_eff']}E cores ({info['cpu_total']} total)")
+    elif info["cpu_total"]:
+        parts.append(f"CPU: {info['cpu_total']} cores")
+    if info["gpu_cores"]:
+        parts.append(f"GPU: {info['gpu_cores']} Metal cores")
+    if info["cuda_gpus"]:
+        gpu_name = _nvidia_gpu_name() or "NVIDIA"
+        parts.append(f"GPU: {info['cuda_gpus']}× {gpu_name}")
+    parts.append(f"JAX {jax.__version__}")
+    return "   ".join(parts)
 
 
 def plot(results, ops, devices, sizes, out):
@@ -202,11 +283,7 @@ def plot(results, ops, devices, sizes, out):
         ax.legend(fontsize=9)
         ax.grid(True, which="both", alpha=0.3)
 
-    hw_text = (
-        f"CPU: {info['cpu_perf']}P + {info['cpu_eff']}E cores ({info['cpu_total']} total)   "
-        f"GPU: {info['gpu_cores']} Metal cores   "
-        f"JAX {jax.__version__}"
-    )
+    hw_text = _hw_footer(info)
     fig.text(0.5, -0.02, hw_text, ha="center", fontsize=9, color="#555555",
              bbox=dict(boxstyle="round,pad=0.3", facecolor="#f5f5f5", edgecolor="#cccccc"))
 
@@ -268,8 +345,7 @@ def main():
 
     info = system_info()
     print(f"JAX {jax.__version__}  |  {chip_name()}")
-    print(f"CPU: {info['cpu_perf']}P + {info['cpu_eff']}E cores ({info['cpu_total']} total)  |  "
-          f"GPU: {info['gpu_cores']} Metal cores")
+    print(_hw_footer(info))
     print(f"Devices : {', '.join(devices)}")
     print(f"Ops     : {', '.join(ops)}")
     print(f"Sizes   : {args.sizes}")
