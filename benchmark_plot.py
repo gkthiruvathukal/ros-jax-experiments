@@ -43,6 +43,7 @@ def _sysctl(key, default=None):
 
 
 def _proc_cpuinfo_field(field):
+    """Return the first matching field value from /proc/cpuinfo."""
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
@@ -51,6 +52,34 @@ def _proc_cpuinfo_field(field):
     except Exception:
         pass
     return None
+
+
+def _linux_physical_cores():
+    """Count physical CPU cores on Linux via /proc/cpuinfo."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            content = f.read()
+        # Each physical core has a unique (physical id, core id) pair.
+        seen = set()
+        phys_id = core_id = None
+        for line in content.splitlines():
+            if line.startswith("physical id"):
+                phys_id = line.split(":", 1)[1].strip()
+            elif line.startswith("core id"):
+                core_id = line.split(":", 1)[1].strip()
+            elif line == "" and phys_id is not None and core_id is not None:
+                seen.add((phys_id, core_id))
+                phys_id = core_id = None
+        if seen:
+            return len(seen)
+    except Exception:
+        pass
+    # Final fallback: logical count via os
+    try:
+        import os
+        return os.cpu_count() or 0
+    except Exception:
+        return 0
 
 
 def _nvidia_gpu_name():
@@ -96,11 +125,7 @@ def system_info():
 
     # Linux fallback for physical CPU count
     if cpu_total == 0:
-        try:
-            import os
-            cpu_total = os.cpu_count() or 0
-        except Exception:
-            pass
+        cpu_total = _linux_physical_cores()
 
     # Metal GPU cores (macOS only)
     metal_cores = None
